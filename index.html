@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mémoria</title>
+  <meta name="description" content="Révision de flashcards avec répétition espacée, hors ligne.">
+  <meta name="theme-color" content="#F4F3EE" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#262421" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Mémoria">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <main id="view" tabindex="-1"></main>
+    <nav id="tabbar" aria-label="Navigation principale">
+      <a href="#/home" data-tab="home">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 9.5V20h13V9.5"/></svg>
+        <span>Accueil</span>
+      </a>
+      <a href="#/progress" data-tab="progress">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M21 20H3"/></svg>
+        <span>Progrès</span>
+      </a>
+      <a href="#/cards" data-tab="cards">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="14" height="14" rx="2"/><path d="M7 3h12a2 2 0 0 1 2 2v12"/></svg>
+        <span>Cartes</span>
+      </a>
+      <a href="#/settings" data-tab="settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>
+        <span>Réglages</span>
+      </a>
+    </nav>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <!-- Cartes : un fichier par matière -->
+  <script src="data/fiscalite-anticipee.js"></script>
+  <script src="data/fiscalite-directe.js"></script>
+  <script src="data/fiscalite-indirecte.js"></script>
+
+  <script src="app.js"></script>
+</body>
+</html>
