@@ -1,6 +1,6 @@
 // Service worker : garde l'application disponible hors ligne.
 // Change CACHE à chaque mise à jour des fichiers pour que les appareils récupèrent la nouvelle version.
-const CACHE = 'memoria-v1';
+const CACHE = 'memoria-v2';
 const FILES = [
   './',
   'index.html',

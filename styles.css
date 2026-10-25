@@ -196,7 +196,7 @@ strong { font-weight: 650; }
 .bar { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
 .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
 
-input[type="text"], input[type="search"], input[type="date"], input[type="number"], select, textarea {
+input[type="text"], input[type="search"], input[type="date"], input[type="number"], input[type="email"], input[type="password"], select, textarea {
   width: 100%;
   font: inherit;
   color: var(--text);

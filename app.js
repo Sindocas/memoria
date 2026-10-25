@@ -41,6 +41,7 @@
       edits: {},      // id -> champs modifiés d'une carte d'origine
       hidden: {},     // id -> date de masquage
       sessions: [],   // historique des sessions
+      deleted: {},    // 'type:id' (ou 'type:*') -> date de suppression, pour que la synchro ne ressuscite rien
       settings: {
         newPerSession: 10,
         examDate: '2028-04-03',
@@ -69,9 +70,23 @@
   function save() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
     catch (e) { toast('Impossible d’enregistrer sur cet appareil.'); }
+    scheduleSync();
   }
 
-  // Fusionne une autre sauvegarde (import, et plus tard synchronisation) : la version la plus récente gagne.
+  // Note une suppression, pour qu'elle s'applique aussi sur les autres appareils.
+  function forget(key) { state.deleted[key] = Date.now(); }
+
+  function applyDeletions() {
+    const del = state.deleted;
+    const gone = (key, t) => [key, key.split(':')[0] + ':*'].some(k => del[k] && (t || 0) <= del[k]);
+    for (const [id, p] of Object.entries(state.progress)) if (gone('progress:' + id, p.updatedAt)) delete state.progress[id];
+    state.custom = state.custom.filter(c => !gone('custom:' + c.id, c.updatedAt || c.createdAt));
+    for (const [id, e] of Object.entries(state.edits)) if (gone('edits:' + id, e.updatedAt)) delete state.edits[id];
+    for (const [id, t] of Object.entries(state.hidden)) if (gone('hidden:' + id, t)) delete state.hidden[id];
+    state.sessions = state.sessions.filter(s => !gone('sessions:' + s.at, s.at));
+  }
+
+  // Fusionne une autre sauvegarde (import ou synchronisation) : la version la plus récente gagne.
   function mergeState(other) {
     const newer = (a, b) => (!a || (b && (b.updatedAt || 0) > (a.updatedAt || 0)) ? b : a);
     for (const [id, p] of Object.entries(other.progress || {})) state.progress[id] = newer(state.progress[id], p);
@@ -79,10 +94,107 @@
     for (const c of other.custom || []) custom.set(c.id, newer(custom.get(c.id), c));
     state.custom = Array.from(custom.values());
     for (const [id, e] of Object.entries(other.edits || {})) state.edits[id] = newer(state.edits[id], e);
-    Object.assign(state.hidden, other.hidden || {});
+    for (const [id, t] of Object.entries(other.hidden || {})) state.hidden[id] = Math.max(state.hidden[id] || 0, t);
+    for (const [k, t] of Object.entries(other.deleted || {})) state.deleted[k] = Math.max(state.deleted[k] || 0, t);
     const seen = new Set(state.sessions.map(s => s.at));
     for (const s of other.sessions || []) if (!seen.has(s.at)) state.sessions.push(s);
     state.sessions.sort((a, b) => a.at - b.at);
+    applyDeletions();
+  }
+
+  // ---------- Synchronisation (Supabase) ----------
+  const SUPABASE_URL = 'https://crvnmnzntyjeexxdciwd.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_6u7eVpo_BR64ibonOLTItA_NV5Mpx-W';
+  const AUTH_KEY = 'memoria.auth';
+  let auth = (() => { try { return JSON.parse(localStorage.getItem(AUTH_KEY)) || null; } catch (e) { return null; } })();
+  let syncing = null;
+  let syncTimer = null;
+
+  function saveAuth() {
+    try { if (auth) localStorage.setItem(AUTH_KEY, JSON.stringify(auth)); else localStorage.removeItem(AUTH_KEY); } catch (e) { /* rien */ }
+  }
+
+  async function api(path, { method = 'GET', body, token, prefer } = {}) {
+    const headers = { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = 'Bearer ' + token;
+    if (prefer) headers.Prefer = prefer;
+    const res = await fetch(SUPABASE_URL + path, { method, headers, body: body && JSON.stringify(body) });
+    const data = res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const err = new Error((data && (data.msg || data.error_description || data.message)) || 'Erreur ' + res.status);
+      err.status = res.status;
+      err.code = data && (data.error_code || data.code);
+      throw err;
+    }
+    return data;
+  }
+
+  function keepSession(j) {
+    auth = { access: j.access_token, refresh: j.refresh_token, exp: Date.now() + j.expires_in * 1000, email: j.user.email, uid: j.user.id, lastSync: auth && auth.lastSync };
+    saveAuth();
+  }
+
+  async function signIn(email, password, create) {
+    const j = await api(create ? '/auth/v1/signup' : '/auth/v1/token?grant_type=password', { method: 'POST', body: { email, password } });
+    if (!j || !j.access_token) throw new Error('Compte créé, mais Supabase demande une confirmation par e-mail.');
+    keepSession(j);
+  }
+
+  function authMessage(e) {
+    if (!navigator.onLine) return 'Pas de réseau : réessaie quand tu es connectée à Internet.';
+    if (e.code === 'invalid_credentials') return 'E-mail ou mot de passe incorrect.';
+    if (e.code === 'user_already_exists') return 'Ce compte existe déjà : utilise « Se connecter ».';
+    if (e.code === 'weak_password') return 'Mot de passe trop court (6 caractères minimum).';
+    if (e.code === 'signup_disabled') return 'La création de comptes est fermée.';
+    if (e.code === 'email_not_confirmed') return 'Ton e-mail n’est pas encore confirmé.';
+    return e.message || 'La connexion a échoué.';
+  }
+
+  async function freshToken() {
+    if (Date.now() < auth.exp - 60000) return auth.access;
+    try {
+      keepSession(await api('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: auth.refresh } }));
+    } catch (e) {
+      if (e.status >= 400 && e.status < 500) { auth = null; saveAuth(); }
+      throw e;
+    }
+    return auth.access;
+  }
+
+  function syncedPart() {
+    const { v, progress, custom, edits, hidden, sessions, deleted } = state;
+    return { v, progress, custom, edits, hidden, sessions, deleted };
+  }
+
+  // Récupère la progression en ligne, la fusionne avec celle de l'appareil, puis renvoie le résultat.
+  function sync() {
+    if (!auth || !navigator.onLine) return Promise.resolve(false);
+    if (syncing) return syncing;
+    syncing = (async () => {
+      const token = await freshToken();
+      const rows = await api('/rest/v1/memoria_state?select=data', { token });
+      if (rows && rows[0]) {
+        const before = JSON.stringify(syncedPart());
+        mergeState(rows[0].data);
+        if (JSON.stringify(syncedPart()) !== before) {
+          try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { /* rien */ }
+          refreshCards();
+          const route = (location.hash || '#/home').split('/')[1];
+          if (['home', 'progress', 'cards', 'settings'].includes(route)) render();
+        }
+      }
+      await api('/rest/v1/memoria_state', { method: 'POST', token, prefer: 'resolution=merge-duplicates,return=minimal', body: { user_id: auth.uid, data: syncedPart(), updated_at: new Date().toISOString() } });
+      auth.lastSync = Date.now();
+      saveAuth();
+      return true;
+    })().finally(() => { syncing = null; });
+    return syncing;
+  }
+
+  function scheduleSync() {
+    if (!auth) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => sync().catch(() => {}), 4000);
   }
 
   // ---------- Cartes ----------
@@ -734,13 +846,14 @@
     if (reset) reset.onclick = () => {
       if (!confirm('Remettre la progression de cette carte à zéro ?')) return;
       delete state.progress[id];
+      forget('progress:' + id);
       save();
       renderCard(id);
       toast('Progression remise à zéro.');
     };
     $('#delete').onclick = () => {
       if (!confirm(c.custom ? 'Supprimer définitivement cette carte ?' : 'Retirer cette carte de tes révisions ? Tu pourras la récupérer dans les réglages.')) return;
-      if (c.custom) state.custom = state.custom.filter(x => x.id !== id);
+      if (c.custom) { state.custom = state.custom.filter(x => x.id !== id); forget('custom:' + id); }
       else state.hidden[id] = Date.now();
       save();
       refreshCards();
@@ -823,6 +936,7 @@
     const restore = $('#restore');
     if (restore) restore.onclick = () => {
       delete state.edits[id];
+      forget('edits:' + id);
       save();
       refreshCards();
       location.replace('#/card/' + encodeURIComponent(id));
@@ -858,9 +972,29 @@
         ${[['auto', 'Automatique'], ['light', 'Clair'], ['dark', 'Sombre']].map(([k, l]) => `<button class="toggle" data-theme-choice="${k}" aria-pressed="${s.theme === k}">${l}</button>`).join('')}
       </div>
 
-      <h2>Sauvegarde et synchronisation</h2>
+      <h2>Synchronisation</h2>
       <div class="card stack">
-        <p class="small muted">La synchronisation automatique entre ton iPhone et ton iPad sera activée lors de la mise en ligne. En attendant, tu peux exporter tes progrès et les importer sur un autre appareil.</p>
+        ${auth ? `
+          <p><b>Connectée</b> · ${esc(auth.email)}</p>
+          <p class="small muted">Ta progression se synchronise toute seule dès que tu as du réseau. ${auth.lastSync ? 'Dernière synchronisation : ' + new Date(auth.lastSync).toLocaleString('fr-CH', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + '.' : ''}</p>
+          <button class="btn soft block" id="sync-now">Synchroniser maintenant</button>
+          <button class="btn ghost block" id="logout">Se déconnecter</button>` : `
+          <p class="small muted">Connecte-toi avec le même compte sur ton iPhone et ton iPad pour retrouver la même progression partout.</p>
+          <form id="login-form" class="stack" autocomplete="on">
+            <label class="field"><span>E-mail</span>
+              <input type="email" name="email" required autocomplete="username" autocapitalize="off" inputmode="email">
+            </label>
+            <label class="field"><span>Mot de passe</span>
+              <input type="password" name="password" required minlength="6" autocomplete="current-password">
+            </label>
+            <button class="btn primary block" type="submit">Se connecter</button>
+            <button class="btn ghost block" type="button" id="signup">Créer mon compte</button>
+          </form>`}
+      </div>
+
+      <h2>Sauvegarde</h2>
+      <div class="card stack">
+        <p class="small muted">Une copie de secours de tes progrès dans un fichier, au cas où.</p>
         <button class="btn ghost block" id="export">Exporter mes progrès</button>
         <label class="btn ghost block" for="import-file">Importer une sauvegarde</label>
         <input type="file" id="import-file" accept="application/json,.json" hidden>
@@ -879,6 +1013,39 @@
     $('#new-plus').onclick = () => setNew(s.newPerSession + 1);
     $('#exam').onchange = e => { if (e.target.value) { s.examDate = e.target.value; save(); toast('Date enregistrée.'); } };
     for (const b of $$('[data-theme-choice]')) b.onclick = () => { s.theme = b.dataset.themeChoice; save(); applyTheme(); renderSettings(); };
+
+    const loginForm = $('#login-form');
+    if (loginForm) {
+      const connect = async create => {
+        if (!loginForm.reportValidity()) return;
+        const buttons = $$('button', loginForm);
+        buttons.forEach(b => { b.disabled = true; });
+        try {
+          await signIn(loginForm.email.value.trim(), loginForm.password.value, create);
+          await sync();
+          toast(create ? 'Compte créé, synchronisation activée.' : 'Connectée, progression synchronisée.');
+          renderSettings();
+        } catch (e) {
+          buttons.forEach(b => { b.disabled = false; });
+          toast(authMessage(e));
+        }
+      };
+      loginForm.onsubmit = e => { e.preventDefault(); connect(false); };
+      $('#signup').onclick = () => connect(true);
+    } else {
+      $('#sync-now').onclick = async () => {
+        try { await sync(); toast('Progression synchronisée.'); }
+        catch (e) { toast(navigator.onLine ? 'La synchronisation a échoué, réessaie plus tard.' : 'Pas de réseau pour le moment.'); }
+        renderSettings();
+      };
+      $('#logout').onclick = () => {
+        if (!confirm('Te déconnecter ? Ta progression reste sur cet appareil.')) return;
+        api('/auth/v1/logout', { method: 'POST', token: auth.access }).catch(() => {});
+        auth = null;
+        saveAuth();
+        renderSettings();
+      };
+    }
 
     $('#export').onclick = () => {
       const blob = new Blob([JSON.stringify(state)], { type: 'application/json' });
@@ -906,12 +1073,14 @@
       }
     };
     const unhide = $('#unhide');
-    if (unhide) unhide.onclick = () => { state.hidden = {}; save(); refreshCards(); renderSettings(); toast('Cartes récupérées.'); };
+    if (unhide) unhide.onclick = () => { state.hidden = {}; forget('hidden:*'); save(); refreshCards(); renderSettings(); toast('Cartes récupérées.'); };
     $('#wipe').onclick = () => {
       if (!confirm('Effacer toute ta progression ? Tes cartes ajoutées sont conservées.')) return;
       if (!confirm('Vraiment ? Cette action est définitive.')) return;
       state.progress = {};
       state.sessions = [];
+      forget('progress:*');
+      forget('sessions:*');
       save();
       toast('Progression effacée.');
       renderSettings();
@@ -923,6 +1092,12 @@
   refreshCards();
   window.addEventListener('hashchange', render);
   render();
+
+  // Synchronise au démarrage, au retour du réseau, et quand l'app passe au premier ou à l'arrière-plan.
+  const syncQuietly = () => sync().catch(() => {});
+  syncQuietly();
+  window.addEventListener('online', syncQuietly);
+  document.addEventListener('visibilitychange', syncQuietly);
 
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
